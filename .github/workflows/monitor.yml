@@ -3,6 +3,9 @@ name: TabiToken registration monitor
 # Runs every 30 minutes via GitHub Actions (free). State is carried between
 # runs with actions/cache so notifications fire on CHANGES only.
 # In your repo this file lives at: .github/workflows/monitor.yml
+#
+# IMPORTANT: every action used below is first-party (actions/*), so this runs
+# even under the strictest repo policy ("Allow actions created by GitHub").
 
 on:
   schedule:
@@ -56,8 +59,20 @@ jobs:
           path: monitor_last.png
           if-no-files-found: ignore
 
-      # GitHub pauses scheduled workflows after 60 days of repo inactivity;
-      # this keeps the repo "active" so the monitor truly runs forever.
+      # GitHub pauses schedules after ~60 days of repo inactivity. Pure-shell
+      # keepalive (NO third-party action): push one empty commit if the newest
+      # commit is older than 50 days, otherwise do nothing.
       - name: Keep the schedule alive
         if: always()
-        uses: gautamkrishnar/keepalive-workflow@v2
+        run: |
+          last=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+          now=$(date +%s)
+          if [ $((now - last)) -gt 4320000 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive: keep scheduled workflows active"
+            git push
+            echo "keepalive commit pushed"
+          else
+            echo "repo is fresh enough - no keepalive needed"
+          fi
