@@ -1,0 +1,63 @@
+name: TabiToken registration monitor
+
+# Runs every 30 minutes via GitHub Actions (free). State is carried between
+# runs with actions/cache so notifications fire on CHANGES only.
+# In your repo this file lives at: .github/workflows/monitor.yml
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
+  workflow_dispatch:          # manual "Run workflow" button for testing
+
+permissions:
+  contents: write             # needed by the keepalive step
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Restore last known state
+        uses: actions/cache/restore@v4
+        with:
+          path: .monitor_state
+          key: tabi-state-${{ github.run_id }}
+          restore-keys: tabi-state-
+
+      - name: Run the check
+        run: python tabi_monitor.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+
+      - name: Save state for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .monitor_state
+          key: tabi-state-${{ github.run_id }}
+
+      - name: Upload last screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-screenshot
+          path: monitor_last.png
+          if-no-files-found: ignore
+
+      # GitHub pauses scheduled workflows after 60 days of repo inactivity;
+      # this keeps the repo "active" so the monitor truly runs forever.
+      - name: Keep the schedule alive
+        if: always()
+        uses: gautamkrishnar/keepalive-workflow@v2
