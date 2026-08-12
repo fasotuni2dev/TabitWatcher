@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""TabiToken registration monitor.
+"""TabiToken registration monitor (two-layer).
 
-Fills the signup form at https://tabitoken.com/sign-up and reads the sonner
-toast that comes back. As long as the toast says "New user registration has
-been disabled by administrator", registration is closed. Any OTHER outcome
-(a redirect, a success toast, even "username already exists") means the
-registration request was actually processed => registration is OPEN.
+Layer 1 (fast, no browser): TabiToken runs on the new-api project, which
+exposes a public GET /api/status endpoint with a register_enabled flag -
+the same flag the frontend reads. If that answers, we're done in seconds.
 
-Statuses:  closed  -> the disabled-by-admin toast appeared
-           open    -> the request was processed / we were redirected
-           unknown -> transient trouble (network, turnstile, page changed)
+Layer 2 (fallback): a headless browser reproduces the manual test - fill the
+signup form, wait for the Turnstile token (the submit button stays DISABLED
+until it arrives), click Create account, read the sonner toast. The exact
+"registration has been disabled" text => closed; any other toast or a
+redirect => open; Turnstile/network trouble => unknown.
 
-Notifications fire on state CHANGES only (closed -> open, open -> closed),
-so an open site doesn't spam you every 30 minutes. OPEN results are
-double-checked with a second pass before notifying.
+Notifications fire on state CHANGES only (closed <-> open), and OPEN results
+are double-checked with a second pass before notifying.
 
 Run once (cron / GitHub Actions):   python tabi_monitor.py
 Run forever locally, every 30 min:  python tabi_monitor.py --loop
@@ -21,7 +20,7 @@ Run forever locally, every 30 min:  python tabi_monitor.py --loop
 Env vars for notifications (optional):
   TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID   and/or   DISCORD_WEBHOOK
 Optional overrides:
-  MONITOR_USERNAME / MONITOR_PASSWORD  (fixed on purpose - see below)
+  MONITOR_USERNAME / MONITOR_PASSWORD  (fixed on purpose - see check_via_browser)
 """
 
 import argparse
@@ -33,17 +32,24 @@ from datetime import datetime, timezone
 
 from playwright.async_api import async_playwright
 
-SIGNUP_URL = "https://tabitoken.com/sign-up"
+SITE = "https://tabitoken.com"
+SIGNUP_URL = f"{SITE}/sign-up"
+STATUS_URL = f"{SITE}/api/status"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".monitor_state")
 
-# Fixed credentials ON PURPOSE: once registration opens, the first check may
-# create this account - the credentials are in the notification, so it's yours.
-# On later checks "username already exists" still proves registration is open.
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+)
+
+# Fixed credentials ON PURPOSE: once registration opens, the first browser check
+# may create this account - the credentials go into the notification, so it's yours.
 MONITOR_USERNAME = os.environ.get("MONITOR_USERNAME", "monitorcheckbot")
 MONITOR_PASSWORD = os.environ.get("MONITOR_PASSWORD", "MonitorCheck2026!")  # 8-20 chars required
 
 DISABLED_TEXT = "registration has been disabled"
 TURNSTILE_HINTS = ("turnstile", "captcha", "challenge", "verify you are", "verification failed")
+REGISTER_KEYS = ("register_enabled", "registerEnabled", "registration_enabled", "RegisterEnabled")
 
 
 def log(msg):
@@ -95,8 +101,39 @@ def write_state(state):
         pass
 
 
-async def check_once():
-    """One signup attempt. Returns (status, detail)."""
+# ---------------------------------------------------------------- Layer 1: API
+def check_via_api():
+    """GET /api/status and read the register_enabled flag.
+    Returns (status, detail) or None if the endpoint can't answer."""
+    req = urllib.request.Request(STATUS_URL, headers={
+        "User-Agent": BROWSER_UA,
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+        data = json.loads(raw)
+    except Exception as e:
+        log(f"[api] /api/status unreachable or not JSON: {e}")
+        return None
+
+    payload = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(payload, dict):
+        payload = data if isinstance(data, dict) else {}
+
+    for key in REGISTER_KEYS:
+        if key in payload:
+            enabled = bool(payload[key])
+            log(f"[api] /api/status: {key}={payload[key]!r}")
+            return ("open" if enabled else "closed"), f"/api/status: {key}={payload[key]!r}"
+
+    log(f"[api] endpoint answered but no register flag found. Payload keys: {list(payload)[:20]}")
+    return None
+
+
+# ------------------------------------------------------------- Layer 2: browser
+async def check_via_browser():
+    """One real signup attempt in headless Chromium. Returns (status, detail)."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -109,10 +146,7 @@ async def check_once():
         try:
             context = await browser.new_context(
                 viewport={"width": 1366, "height": 768},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-                ),
+                user_agent=BROWSER_UA,
                 locale="en-US",
             )
             page = await context.new_page()
@@ -123,16 +157,23 @@ async def check_once():
             await page.fill("input[name='password']", MONITOR_PASSWORD)
             await page.fill("input[name='confirmPassword']", MONITOR_PASSWORD)
 
-            # Turnstile auto-solves on most IPs; wait for the token, but submit regardless.
+            # The submit button stays DISABLED until the Turnstile token exists.
+            # Give the widget a real chance (slow on datacenter IPs), then bail
+            # cleanly instead of timing out on a dead click.
             try:
                 await page.wait_for_function(
                     "(() => { const el = document.querySelector('input[name=\"cf-turnstile-response\"]');"
                     " return el && el.value && el.value.length > 10; })()",
-                    timeout=20000,
+                    timeout=45000,
                 )
-                log("Turnstile token present.")
+                log("[browser] Turnstile token present.")
             except Exception:
-                log("No Turnstile token after 20s - submitting anyway.")
+                return "unknown", "Turnstile never auto-solved on this IP (no token after 45s)"
+
+            try:
+                await page.wait_for_selector("button[type='submit']:not([disabled])", timeout=10000)
+            except Exception:
+                return "unknown", "submit button stayed disabled even with a Turnstile token"
 
             await page.click("button[type='submit']")
 
@@ -157,6 +198,16 @@ async def check_once():
             return "unknown", f"no toast appeared; still on {url}"
         finally:
             await browser.close()
+
+
+async def check_once():
+    """Layered check: cheap API first, browser submit as fallback."""
+    api_result = await asyncio.to_thread(check_via_api)
+    if api_result is not None:
+        log("[api] answered - skipping the browser check.")
+        return api_result
+    log("[api] couldn't answer - falling back to the browser check.")
+    return await check_via_browser()
 
 
 async def run_once():
@@ -184,7 +235,7 @@ async def run_once():
         notify(
             "🟢 TabiToken registration is OPEN!",
             f"{detail}\nChecked at {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC.\n"
-            f"https://tabitoken.com/sign-up\n\n"
+            f"{SIGNUP_URL}\n\n"
             f"If the check created an account, it's yours:\n"
             f"username: {MONITOR_USERNAME}\npassword: {MONITOR_PASSWORD}",
         )
