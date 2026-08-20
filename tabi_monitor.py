@@ -51,6 +51,26 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".monitor_
 MONITOR_USERNAME = os.environ.get("MONITOR_USERNAME", "monitorcheckbot")
 MONITOR_PASSWORD = os.environ.get("MONITOR_PASSWORD", "MonitorCheck2026!")  # 8-20 chars required
 
+# Optional residential exit for the probes. GitHub Actions runs from datacenter
+# IPs and Turnstile often refuses to auto-solve there - "no Turnstile token
+# after 20s" on every probe, and on gorouter the missing token also keeps the
+# submit button disabled. Set MONITOR_PROXY and the probes come from a real
+# address, same as a browser at home.
+# Format: http://user:pass@host:port  (a Decodo sticky session is ideal)
+def _proxy_cfg():
+    # Read at CALL time, not import time - a value injected after this module
+    # loaded must still be honored (and it makes the config testable).
+    url = os.environ.get("MONITOR_PROXY", "").strip()
+    if not url:
+        return None
+    from urllib.parse import urlsplit
+    u = urlsplit(url)
+    cfg = {"server": "%s://%s:%s" % (u.scheme, u.hostname, u.port)}
+    if u.username:
+        cfg["username"] = u.username
+        cfg["password"] = u.password or ""
+    return cfg
+
 DISABLED_TEXT = "registration has been disabled"
 TURNSTILE_HINTS = ("turnstile", "captcha", "challenge", "verify you are", "verification failed")
 
@@ -121,6 +141,7 @@ async def check_site(browser, site):
     storage) - one site's state can never leak into the other's result.
     """
     context = await browser.new_context(
+        proxy=_proxy_cfg(),
         viewport={"width": 1366, "height": 768},
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -133,9 +154,19 @@ async def check_site(browser, site):
         await page.goto(site["url"], timeout=60000, wait_until="domcontentloaded")
         await page.wait_for_selector("input[name='username']", timeout=30000)
 
-        await page.fill("input[name='username']", MONITOR_USERNAME)
-        await page.fill("input[name='password']", MONITOR_PASSWORD)
-        await page.fill("input[name='confirmPassword']", MONITOR_PASSWORD)
+        # This stack validates on change/blur and keeps the submit button
+        # disabled until it passes. A bare fill() never "touches" a field, so
+        # the button never enabled (the 09:16 run: 58 click retries, 30s,
+        # UNKNOWN). Type for real (per-key onChange) and Tab out of each field
+        # (blur -> touched -> validation fires).
+        for sel, value in (
+            ("input[name='username']", MONITOR_USERNAME),
+            ("input[name='password']", MONITOR_PASSWORD),
+            ("input[name='confirmPassword']", MONITOR_PASSWORD),
+        ):
+            await page.click(sel)
+            await page.press_sequentially(sel, value, delay=25)
+            await page.press(sel, "Tab")
 
         # Turnstile auto-solves on most IPs; wait for the token, but submit regardless.
         try:
@@ -148,7 +179,29 @@ async def check_site(browser, site):
         except Exception:
             log(f"{site['name']}: no Turnstile token after 20s - submitting anyway.")
 
-        await page.click("button[type='submit']")
+        # Wait for the button to ENABLE rather than slamming a disabled one:
+        # it unlocks when validation AND the Turnstile token are both in.
+        submit_sel = "button[type='submit']"
+        try:
+            await page.wait_for_function(
+                "() => { const b = document.querySelector('button[type=submit]');"
+                " return b && !b.disabled && !b.hasAttribute('data-disabled'); }",
+                timeout=15000,
+            )
+        except Exception:
+            log(f"{site['name']}: submit still disabled after 15s - forcing it")
+        try:
+            await page.click(submit_sel, timeout=5000)
+        except Exception:
+            # The creds meet every rule, so a still-disabled button is a stuck
+            # binding, not a real invalid form: strip the attribute and click
+            # through JS. The server answers with a toast either way, and the
+            # toast is the only thing the classifier reads.
+            log(f"{site['name']}: click blocked - removing 'disabled' via JS")
+            await page.eval_on_selector(
+                submit_sel,
+                "b => { b.removeAttribute('disabled'); b.removeAttribute('data-disabled'); b.click(); }",
+            )
 
         toast = None
         try:
@@ -176,6 +229,8 @@ async def check_site(browser, site):
 async def run_once():
     prev_all = read_state()
     new_all = dict(prev_all)
+    _pc = _proxy_cfg()
+    log("Proxy: " + (_pc["server"] if _pc else "direct (datacenter IP)"))
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
