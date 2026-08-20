@@ -41,6 +41,7 @@ jobs:
       - name: Run the check
         run: python tabi_monitor.py
         env:
+          MONITOR_PROXY: ${{ secrets.MONITOR_PROXY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
