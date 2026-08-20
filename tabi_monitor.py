@@ -165,7 +165,7 @@ async def check_site(browser, site):
             ("input[name='confirmPassword']", MONITOR_PASSWORD),
         ):
             await page.click(sel)
-            await page.press_sequentially(sel, value, delay=25)
+            await page.locator(sel).press_sequentially(value, delay=25)
             await page.press(sel, "Tab")
 
         # Turnstile auto-solves on most IPs; wait for the token, but submit regardless.
