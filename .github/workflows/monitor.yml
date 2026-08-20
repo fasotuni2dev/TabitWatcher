@@ -1,7 +1,8 @@
-name: TabiToken registration monitor
+name: TabiToken + GoRouter registration monitor
 
-# Runs every 30 minutes via GitHub Actions (free). State is carried between
-# runs with actions/cache so notifications fire on CHANGES only.
+# Runs every 30 minutes via GitHub Actions (free), checking BOTH sites in one
+# pass. State is carried between runs with actions/cache so notifications fire
+# on CHANGES only.
 # In your repo this file lives at: .github/workflows/monitor.yml
 #
 # IMPORTANT: every action used below is first-party (actions/*), so this runs
@@ -51,12 +52,12 @@ jobs:
           path: .monitor_state
           key: tabi-state-${{ github.run_id }}
 
-      - name: Upload last screenshot
+      - name: Upload last screenshots (one per site)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: monitor-screenshot
-          path: monitor_last.png
+          name: monitor-screenshots
+          path: monitor_last_*.png
           if-no-files-found: ignore
 
       # GitHub pauses schedules after ~60 days of repo inactivity. Pure-shell
