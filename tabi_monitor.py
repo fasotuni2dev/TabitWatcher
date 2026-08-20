@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""TabiToken + GoRouter registration monitor (API edition).
+"""TabiToken + GoRouter registration monitor (API edition, hardened).
 
 Checks /api/status on each site for the register_enabled flag. No browser,
 no Turnstile, no form submission - just a lightweight HTTP probe.
 
-Statuses per site:  closed  -> register_enabled is false
+Hardened against false negatives:
+- Cache-busting query param on every request
+- Retries once after 3s if result is "closed" (guards against stale cache)
+- Logs raw register_enabled value for debugging
+
+Statuses per site:  closed  -> register_enabled is false (confirmed twice)
                     open    -> register_enabled is true
                     unknown -> network error, invalid JSON, missing key
 
@@ -22,7 +27,9 @@ import argparse
 import asyncio
 import json
 import os
+import time
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 
 SITES = [
@@ -90,50 +97,79 @@ def write_state(states):
         pass
 
 
-async def check_site(site):
+async def check_site(site, retry_on_closed=True):
     """Hit /api/status and classify registration status.
     
     Returns (status, detail) where status is 'open', 'closed', or 'unknown'.
-    Runs the blocking HTTP call in a thread so we stay async-friendly.
+    
+    If result is 'closed' and retry_on_closed is True, waits 3s and checks
+    again to guard against stale cache or transient false negatives.
     """
     url = f"{site['url']}/api/status"
     
-    def _fetch():
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; RegistrationMonitor/1.0)",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode())
-    
-    try:
-        data = await asyncio.to_thread(_fetch)
-        # Navigate to data.register_enabled, tolerating missing keys
-        enabled = data.get("data", {}).get("register_enabled")
+    async def _single_attempt():
+        def _fetch():
+            # Cache-busting: add timestamp to defeat CDN/browser caching
+            cache_buster = int(time.time())
+            req = urllib.request.Request(
+                f"{url}?_t={cache_buster}",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; RegistrationMonitor/1.0)",
+                    "Accept": "application/json",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
         
-        if enabled is True:
-            return "open", "register_enabled: true"
-        elif enabled is False:
-            return "closed", "register_enabled: false"
-        else:
-            return "unknown", f"unexpected register_enabled value: {enabled!r}"
+        try:
+            data = await asyncio.to_thread(_fetch)
+            # Navigate to data.register_enabled, tolerating missing keys
+            enabled = data.get("data", {}).get("register_enabled")
             
-    except json.JSONDecodeError as e:
-        return "unknown", f"invalid JSON from {url}: {e}"
-    except urllib.error.HTTPError as e:
-        return "unknown", f"HTTP {e.code} from {url}"
-    except Exception as e:
-        return "unknown", f"fetch error for {url}: {e}"
+            # Log the raw value for debugging (helps catch API changes)
+            log(f"{site['name']}: raw register_enabled = {enabled!r}")
+            
+            if enabled is True:
+                return "open", "register_enabled: true"
+            elif enabled is False:
+                return "closed", "register_enabled: false"
+            else:
+                return "unknown", f"unexpected register_enabled value: {enabled!r}"
+                
+        except json.JSONDecodeError as e:
+            return "unknown", f"invalid JSON from {url}: {e}"
+        except urllib.error.HTTPError as e:
+            return "unknown", f"HTTP {e.code} from {url}"
+        except Exception as e:
+            return "unknown", f"fetch error for {url}: {e}"
+    
+    # First attempt
+    status, detail = await _single_attempt()
+    
+    # If we got "closed", wait 3s and retry once to rule out stale cache
+    # or a transient server hiccup. Only confirm closed if both attempts agree.
+    if status == "closed" and retry_on_closed:
+        log(f"{site['name']}: got CLOSED, confirming with fresh request in 3s...")
+        await asyncio.sleep(3)
+        status2, detail2 = await _single_attempt()
+        if status2 == "open":
+            log(f"{site['name']}: retry says OPEN (first attempt was stale/cached)")
+            return "open", f"register_enabled: true (confirmed on retry)"
+        elif status2 == "closed":
+            return "closed", detail  # Both attempts agree it's closed
+        else:
+            return "unknown", f"first pass closed, retry inconclusive: {detail2}"
+    
+    return status, detail
 
 
 async def run_once():
     prev_all = read_state()
     new_all = dict(prev_all)
     
-    log("Checking /api/status endpoints (direct HTTP, no browser)")
+    log("Checking /api/status endpoints (cache-busted HTTP)")
     
     for site in SITES:
         try:
