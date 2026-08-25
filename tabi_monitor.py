@@ -15,6 +15,8 @@ Statuses per site:  closed  -> register_enabled is false (confirmed twice)
 
 Notifications fire on state CHANGES only (closed -> open, open -> closed),
 per site. OPEN results are double-checked with a second pass before notifying.
+UNKNOWN statuses never trigger notifications and never overwrite the
+last known good state.
 
 Run once (cron / GitHub Actions):   python tabi_monitor.py
 Run forever locally, every 30 min:  python tabi_monitor.py --loop
@@ -39,10 +41,8 @@ SITES = [
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".monitor_state")
 
-
 def log(msg):
     print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] {msg}", flush=True)
-
 
 def notify(title, body):
     text = f"{title}\n\n{body}"
@@ -72,7 +72,6 @@ def notify(title, body):
     if not (token and chat) and not hook:
         log("(no notification channel configured - set TELEGRAM_* or DISCORD_WEBHOOK)")
 
-
 def read_state():
     """Per-site last known statuses, e.g. {"tabitoken": "closed", "gorouter": "open"}.
     Legacy format (bare word) is treated as tabitoken-only for continuity."""
@@ -88,14 +87,14 @@ def read_state():
             return {}
     return {"tabitoken": raw} if raw else {}
 
-
 def write_state(states):
+    """Only persist states that are open or closed — never unknown."""
+    clean = {k: v for k, v in states.items() if v in ("open", "closed")}
     try:
         with open(STATE_FILE, "w") as f:
-            f.write(json.dumps(states))
+            f.write(json.dumps(clean))
     except Exception:
         pass
-
 
 async def check_site(site, retry_on_closed=True):
     """Hit /api/status and classify registration status.
@@ -164,10 +163,8 @@ async def check_site(site, retry_on_closed=True):
     
     return status, detail
 
-
 async def run_once():
     prev_all = read_state()
-    new_all = dict(prev_all)
     
     log("Checking /api/status endpoints (cache-busted HTTP)")
     
@@ -178,7 +175,7 @@ async def run_once():
             status, detail = "unknown", f"check error: {e}"
         
         log(f"{site['name']}: {status.upper()} - {detail}")
-        prev = prev_all.get(site["slug"], "unknown")
+        prev = prev_all.get(site["slug"], None)
         
         # Double-check open results before notifying (avoid false positives)
         if status == "open":
@@ -193,7 +190,28 @@ async def run_once():
             except Exception as e:
                 status, detail = "unknown", f"confirmation error: {e}"
         
-        # Notify only on state changes
+        # ===== FIXED NOTIFICATION LOGIC =====
+        # Only notify on confirmed transitions:
+        #   - prev is None (first run, state file missing): don't spam, just record
+        #   - closed -> open: notify OPEN
+        #   - open -> closed: notify CLOSED
+        #   - unknown -> anything: never notify, never change state
+        #   - same state: never notify
+        
+        if status == "unknown":
+            # Never notify on unknown, and don't overwrite the last known good state.
+            # We simply skip persistence and move on.
+            log(f"{site['name']}: unknown status — no notification, keeping last known state '{prev}'.")
+            continue
+        
+        if prev is None:
+            # First run / no state file: record the current state silently.
+            # This prevents spamming "open" on the very first check.
+            log(f"{site['name']}: first run — recording state '{status}' without notifying.")
+            prev_all[site["slug"]] = status
+            continue
+        
+        # Real state transition check
         if status == "open" and prev != "open":
             notify(
                 f"🟢 {site['name']} registration is OPEN!",
@@ -206,18 +224,17 @@ async def run_once():
         else:
             log(f"{site['name']}: no notification (state {prev} -> {status}).")
         
-        new_all[site["slug"]] = status
+        # Persist only known states (open/closed)
+        prev_all[site["slug"]] = status
     
-    write_state(new_all)
-    return new_all
-
+    write_state(prev_all)
+    return prev_all
 
 async def run_loop(interval_minutes):
     while True:
         await run_once()
         log(f"Sleeping {interval_minutes} minutes...")
         await asyncio.sleep(interval_minutes * 60)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TabiToken + GoRouter registration monitor (API edition)")
